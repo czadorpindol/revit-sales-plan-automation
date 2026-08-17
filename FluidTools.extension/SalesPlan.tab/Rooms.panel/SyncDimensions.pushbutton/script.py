@@ -1,147 +1,189 @@
 #! python3
 
+import sys
 import clr
 import math
-import sys
 
 from pyrevit import revit, DB, forms, script
 
-# Use pyrevit's doc
 doc = revit.doc
 
-def ft_to_mm(val_ft):
-    return round(val_ft * 304.8)
+def get_dim_value_str(dim):
+    try:
+        if dim.ValueString:
+            return dim.ValueString.replace(" mm", "").replace("mm", "").strip()
+    except:
+        pass
+    val_ft = dim.Value
+    if val_ft:
+        return str(int(round(val_ft * 304.8)))
+    return ""
 
 def ft_to_imperial_str(val_ft):
+    if not val_ft:
+        return ""
     total_inches = round(val_ft * 12)
     feet = int(total_inches // 12)
     inches = int(total_inches % 12)
     return f"{feet}' {inches}\""
 
-def dist_2d(p1, p2):
-    return math.sqrt((p1.X - p2.X)**2 + (p1.Y - p2.Y)**2)
+def is_horizontal_dim(dim):
+    try:
+        if dim.Curve:
+            dir_vec = dim.Curve.Direction
+            return abs(dir_vec.X) > abs(dir_vec.Y)
+    except:
+        pass
+    return True
+
+def get_dim_point(dim):
+    try:
+        if dim.Curve and dim.Curve.IsBound:
+            return dim.Curve.Evaluate(0.5, True)
+    except:
+        pass
+    try:
+        return dim.Origin
+    except:
+        return None
+
+def clear_param(param):
+    if not param:
+        return
+    try:
+        param.ClearValue()
+    except:
+        if param.StorageType == DB.StorageType.String:
+            param.Set("")
 
 def main():
     try:
-        # 1. Pobranie wymiarów "Fluid Sales Dimension"
-        all_dims = DB.FilteredElementCollector(doc)\
-            .OfClass(DB.Dimension)\
-            .WhereElementIsNotElementType()\
-            .ToElements()
+        # 1. Map wall boundaries to rooms
+        wall_to_rooms = {}
+        spatial_opts = DB.SpatialElementBoundaryOptions()
 
-        target_dims = []
-        for d in all_dims:
-            try:
-                dt = doc.GetElement(d.GetTypeId())
-                if dt and dt.Name == "Fluid Sales Dimension":
-                    target_dims.append(d)
-            except:
-                pass
-
-        # 2. Pobranie tylko UMIESZCZONYCH pomieszczeń (Area > 0)
         all_rooms = DB.FilteredElementCollector(doc)\
             .OfCategory(DB.BuiltInCategory.OST_Rooms)\
             .WhereElementIsNotElementType()\
             .ToElements()
 
-        valid_rooms = []
-        for r in all_rooms:
-            if hasattr(r, "Area") and r.Area > 0 and r.Location:
-                loc_pt = getattr(r.Location, "Point", None)
-                if loc_pt:
-                    valid_rooms.append((r, loc_pt))
+        valid_rooms = [r for r in all_rooms if hasattr(r, "Area") and r.Area > 0]
+        room_bboxes = {r.Id: r.get_BoundingBox(None) for r in valid_rooms}
 
-        # 3. Mapowanie Wymiar -> Najbliższe Room (bez limitu odległości)
+        for room in valid_rooms:
+            boundary_segments = room.GetBoundarySegments(spatial_opts)
+            if boundary_segments:
+                for segment_list in boundary_segments:
+                    for seg in segment_list:
+                        elem_id = seg.ElementId
+                        if elem_id != DB.ElementId.InvalidElementId:
+                            if elem_id not in wall_to_rooms:
+                                wall_to_rooms[elem_id] = set()
+                            wall_to_rooms[elem_id].add(room.Id)
+
+        # 2. Collect target dimensions
+        all_dims = DB.FilteredElementCollector(doc)\
+            .OfClass(DB.Dimension)\
+            .WhereElementIsNotElementType()\
+            .ToElements()
+
+        target_dims = [d for d in all_dims if d.DimensionType and d.DimensionType.Name == "Fluid Sales Dimension"]
+
+        # 3. Match dimensions to rooms by level and orientation
         room_dim_map = {}
-        debug_info = []
 
-        for idx, dim in enumerate(target_dims):
+        for dim in target_dims:
+            val_ft = dim.Value
+            if val_ft is None or val_ft == 0:
+                continue
+
+            dim_view = doc.GetElement(dim.OwnerViewId)
+            dim_level_id = dim_view.GenLevel.Id if (dim_view and hasattr(dim_view, "GenLevel") and dim_view.GenLevel) else None
+
+            matched_room_ids = set()
             try:
-                val = dim.Value
-                if val is None or val == 0: continue
+                refs = dim.References
+                if refs:
+                    for r in refs:
+                        if r.ElementId in wall_to_rooms:
+                            matched_room_ids.update(wall_to_rooms[r.ElementId])
+            except:
+                pass
 
-                pt = None
-                if dim.Curve:
-                    try:
-                        pt = dim.Curve.Evaluate(0.5, True)
-                    except:
-                        pass
-                if not pt:
-                    pt = dim.Origin
+            if dim_level_id:
+                matched_room_ids = {r_id for r_id in matched_room_ids if doc.GetElement(r_id).Level.Id == dim_level_id}
 
-                if not pt: continue
+            assigned_room_id = None
+            if len(matched_room_ids) == 1:
+                assigned_room_id = list(matched_room_ids)[0]
+            else:
+                pt = get_dim_point(dim)
+                if pt:
+                    level_rooms = [r for r in valid_rooms if (not dim_level_id or r.Level.Id == dim_level_id)]
+                    candidates = matched_room_ids if len(matched_room_ids) > 1 else [r.Id for r in level_rooms]
 
-                min_dist = float('inf')
-                closest_room = None
+                    for r_id in candidates:
+                        bbox = room_bboxes.get(r_id)
+                        if bbox and (bbox.Min.X <= pt.X <= bbox.Max.X) and (bbox.Min.Y <= pt.Y <= bbox.Max.Y):
+                            assigned_room_id = r_id
+                            break
 
-                for room, r_pt in valid_rooms:
-                    d = dist_2d(pt, r_pt)
-                    if d < min_dist:
-                        min_dist = d
-                        closest_room = room
+            if assigned_room_id:
+                if assigned_room_id not in room_dim_map:
+                    room_dim_map[assigned_room_id] = {'horiz': [], 'vert': []}
 
-                if closest_room:
-                    r_id = closest_room.Id
-                    if r_id not in room_dim_map:
-                        room_dim_map[r_id] = []
-                    room_dim_map[r_id].append(val)
+                if is_horizontal_dim(dim):
+                    room_dim_map[assigned_room_id]['horiz'].append(dim)
+                else:
+                    room_dim_map[assigned_room_id]['vert'].append(dim)
 
-                    if idx < 3:
-                        r_pt = [p[1] for p in valid_rooms if p[0].Id == closest_room.Id][0]
-                        debug_info.append(f"Wymiar #{idx+1} [X:{round(pt.X,1)}, Y:{round(pt.Y,1)}] -> Room {closest_room.Number} ({closest_room.Name}) [X:{round(r_pt.X,1)}, Y:{round(r_pt.Y,1)}] odleglosc:{round(min_dist,1)}ft")
-            except Exception as ex:
-                debug_info.append(f"Blad przy wymiarze #{idx}: {str(ex)}")
-
-        # 4. Zapis do parametrów Room
-        results_log = []
-        results_log.append(f"--- DIAGNOSTYKA: Wymiary: {len(target_dims)} | Aktywne Rooms: {len(valid_rooms)} | Przypisano: {len(room_dim_map)} ---")
-        results_log.extend(debug_info)
-
+        # 4. Write to room parameters
         with revit.Transaction("Sync Fluid Sales Dimensions"):
-            for room in all_rooms:
-                if not hasattr(room, "Area") or room.Area == 0:
-                    continue # Pomijamy nieumieszczone pomieszczenia w raporcie końcowym
-
-                dims = room_dim_map.get(room.Id, [])
-                count = len(dims)
+            for room in valid_rooms:
+                d_dict = room_dim_map.get(room.Id, {'horiz': [], 'vert': []})
 
                 p_w_mm = room.LookupParameter("Room_Width_mm")
                 p_l_mm = room.LookupParameter("Room_Length_mm")
                 p_w_imp = room.LookupParameter("Room_Width_Imperial")
                 p_l_imp = room.LookupParameter("Room_Length_Imperial")
 
-                if count == 0:
-                    if p_w_mm: p_w_mm.Set(0)
-                    if p_l_mm: p_l_mm.Set(0)
-                    if p_w_imp: p_w_imp.Set("-")
-                    if p_l_imp: p_l_imp.Set("-")
-                    results_log.append(f"Room {room.Number} ({room.Name}): Brak wymiarow")
+                # Width (X-axis)
+                if d_dict['horiz']:
+                    d_horiz = d_dict['horiz'][0]
+                    w_mm_str = get_dim_value_str(d_horiz)
+                    w_imp_str = ft_to_imperial_str(d_horiz.Value)
+                    if p_w_mm:
+                        try:
+                            p_w_mm.Set(float(w_mm_str))
+                        except:
+                            pass
+                    if p_w_imp:
+                        p_w_imp.Set(w_imp_str)
+                else:
+                    clear_param(p_w_mm)
+                    clear_param(p_w_imp)
 
-                elif count == 1:
-                    w_val = dims[0]
-                    if p_w_mm: p_w_mm.Set(ft_to_mm(w_val) / 304.8)
-                    if p_w_imp: p_w_imp.Set(ft_to_imperial_str(w_val))
-                    if p_l_mm: p_l_mm.Set(0)
-                    if p_l_imp: p_l_imp.Set("-")
-                    results_log.append(f"Room {room.Number} ({room.Name}): Width = {ft_to_mm(w_val)}mm")
+                # Length (Y-axis)
+                if d_dict['vert']:
+                    d_vert = d_dict['vert'][0]
+                    l_mm_str = get_dim_value_str(d_vert)
+                    l_imp_str = ft_to_imperial_str(d_vert.Value)
+                    if p_l_mm:
+                        try:
+                            p_l_mm.Set(float(l_mm_str))
+                        except:
+                            pass
+                    if p_l_imp:
+                        p_l_imp.Set(l_imp_str)
+                else:
+                    clear_param(p_l_mm)
+                    clear_param(p_l_imp)
 
-                elif count >= 2:
-                    dims_sorted = sorted(dims, reverse=True)
-                    l_val = dims_sorted[0]
-                    w_val = dims_sorted[1]
-
-                    if p_w_mm: p_w_mm.Set(ft_to_mm(w_val) / 304.8)
-                    if p_l_mm: p_l_mm.Set(ft_to_mm(l_val) / 304.8)
-                    if p_w_imp: p_w_imp.Set(ft_to_imperial_str(w_val))
-                    if p_l_imp: p_l_imp.Set(ft_to_imperial_str(l_val))
-
-                    results_log.append(f"Room {room.Number} ({room.Name}): Width = {ft_to_mm(w_val)}mm, Length = {ft_to_mm(l_val)}mm")
-
-        # Print output
+        # Output feedback
         output = script.get_output()
-        for log in results_log:
-            output.print_md(log)
-            print(log)
+        output.print_md("### Synchronization Complete")
+        output.print_md(f"**Valid Rooms Processed:** {len(valid_rooms)}")
+        output.print_md(f"**Dimensions Mapped:** {sum(len(d['horiz']) + len(d['vert']) for d in room_dim_map.values())}")
 
     except Exception as e:
         forms.alert(str(e), title="Error Syncing Dimensions")
